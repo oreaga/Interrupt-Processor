@@ -115,30 +115,32 @@ module tlb (clk, reset, vpn1, asid1, vpn2, asid2, pfn1, pfn2, miss1, miss2, map2
 	registerX #(8)		tlbregB_pfn	(.reset(res_H), .clk(clk_H), .out(tlbB_pfn), .in(tlbB_pfn__in), .we(tlbB__we));
 
 
-	assign	tlbA__we = 1'b0;
-	assign	tlbA_asid__in = asid1;
-	assign	tlbA_vpn__in = vpn1;
-	assign	tlbA_pfn__in = 8'b0;
-	assign	tlbB__we = 8'b0;
+	assign	tlbA__we = write & ~ctr_out;
+	assign	tlbA_asid__in = asid2;
+	assign	tlbA_vpn__in = vpn2;
+	assign	tlbA_pfn__in = map2;
+	assign	tlbB__we = write & ctr_out;
 	assign	tlbB_asid__in = asid2;
 	assign	tlbB_vpn__in = vpn2;
-	assign	tlbB_pfn__in = 8'b0;
+	assign	tlbB_pfn__in = map2;
 
-        wire            port1_Hits_EntryA;
-        wire            port1_Hits_EntryB;
-        wire            port2_Hits_EntryA;
-        wire            port2_Hits_EntryB;
+        wire            port1_Hits_EntryA = (asid1 == tlbA_asid) && (vpn1 == tlbA_vpn);
+        wire            port1_Hits_EntryB = (asid1 == tlbB_asid) && (vpn1 == tlbB_vpn);
+        wire            port2_Hits_EntryA = (asid2 == tlbA_asid) && (vpn2 == tlbA_vpn);
+        wire            port2_Hits_EntryB = (asid2 == tlbB_asid) && (vpn2 == tlbB_vpn);
 
-        wire            asid1_is_kphys = 1'b0;
-        wire            asid2_is_kphys = 1'b0;
+        wire            asid1_is_kphys = (asid1 == 6'b0) && (vpn1[7] == 1'b0);
+        wire            asid2_is_kphys = (asid2 == 6'b0) && (vpn2[7] == 1'b0);
 
-        assign  pfn1 = 8'b0;
+        assign  pfn1 = (port1_Hits_EntryA) ? tlbA_pfn :
+                       (port1_Hits_EntryB) ? tlbB_pfn : vpn1;
 
-        assign  miss1 = 1'b0;
+        assign  miss1 = ~port1_Hits_EntryA & ~port1_Hits_EntryB & ~asid1_is_kphys;
 
-        assign  pfn2 = 8'b0;
+        assign  pfn2 = (port2_Hits_EntryA) ? tlbA_pfn :
+                       (port2_Hits_EntryB) ? tlbB_pfn : vpn2;
 
-        assign  miss2 = 1'b0;
+        assign  miss2 = ~port2_Hits_EntryA & ~port2_Hits_EntryB & ~asid2_is_kphys;
 
 endmodule
 
@@ -174,7 +176,7 @@ module arithmetic_logic_unit (op, alu1, alu2, bus);
 
 	assign bus =	(op == `ADD) ? alu1 + alu2 :
 			(op == `NAND) ? ~(alu1 & alu2) :
-			alu1;
+			alu2;
 endmodule
 
 
@@ -507,8 +509,9 @@ module RiSC (clk, reset);
 	//
 	// FETCH STAGE
 	//
-	assign	MEM__addr1 = {PC__out[`BYTE_TOP], PC__out[`BYTE_BOT]};
-	assign	IFID_instr__in = 	(Pstomp) ? `ZERO : MEM__data1;
+	assign	MEM__addr1 = {TLB_pfn1__out, PC__out[`BYTE_BOT]};
+	assign	IFID_instr__in = 	(Pstomp) ? `ZERO :
+                                (TLB_miss1__out) ? 16'b0 : MEM__data1;
 	assign	IFID_pc__in = 		(Pstomp) ? `ZERO : PC__out;
 	assign  IFID_exc__in =          (Pstomp) ? 7'd0
 					: (TLB_miss1__out) ? (kmode ? `EXC_TLBKMISS : `EXC_TLBUMISS)
@@ -519,7 +522,7 @@ module RiSC (clk, reset);
 
 
 	assign	TLB_vpn1__in =	PC__out[`BYTE_TOP];
-	assign	TLB_asid1__in = asid;
+	assign	TLB_asid1__in = (kmode) ? 6'b0 : asid;
 
 	IFID	ifid_reg (.reset(res_B|x), .clk(clk_B), .IFID_instr__in(IFID_instr__in), .IFID_pc__in(IFID_pc__in),
 			.IFID_exc__in(IFID_exc__in), .IFID_exc__out(IFID_exc__out),
@@ -561,6 +564,7 @@ module RiSC (clk, reset);
 	// this implementation does not check permissions ... if you want a secure implementation,
 	// need to make sure the operation is allowable (via kmode bit)
 	wire	[6:0]	CTL6_out_exc =	(Pstall) ? 7'd0 :
+                                    (TLB_miss1__out) ? IFID_exc__out :
 					(IFID_op == `EXTEND ? IFID_im : IFID_exc__out);
 
 	assign	Pstall =	(idex_is_lw & (idex_targets_src1 | idex_targets_src2));
@@ -609,12 +613,13 @@ module RiSC (clk, reset);
 	// EXECUTE STAGE
 	//
 	wire		idex_is_addORnand = (IDEX_op__out == `ADD) | (IDEX_op__out == `NAND);
+    wire        idex_is_jalr = (IDEX_op_out == `JALR);
 	wire		idex_is_lui = (IDEX_op__out == `LUI);
 	wire		idex_is_tlbw = (IDEX_exc__out == `TLB_WRITE);
 	wire		idex_is_rfe = (IDEX_exc__out == `RFE_JUMP);
 
 	assign	MUXalu1_out = 	(idex_is_lui) ? IDEX_op0__out : IDEX_op1__out;
-	assign	MUXalu2_out = 	(idex_is_addORnand) ? IDEX_op2__out : IDEX_op0__out;
+	assign	MUXalu2_out = 	(idex_is_addORnand | idex_is_jalr) ? IDEX_op2__out : IDEX_op0__out;
 
 	assign	MUXrfe_out = 	(idex_is_rfe) ? IDEX_op1__out : IDEX_pc__out;
 
@@ -647,13 +652,13 @@ module RiSC (clk, reset);
 	wire	[15:0]	MEM__data2in;
 
 	assign	TLB_write__in = (exmem_is_tlbw) ? 1'b1 : 1'b0;
-	assign	TLB_map2__in = EXMEM_stdata__out[`BYTE_BOT];
-	assign	TLB_vpn2__in = (exmem_is_tlbw) ? EXMEM_ALUout__out[`BYTE_BOT] : EXMEM_ALUout__out[`BYTE_TOP];
+	assign	TLB_map2__in = EXMEM_ALUout__out[`BYTE_BOT];
+	assign	TLB_vpn2__in = (exmem_is_tlbw) ? EXMEM_stdata__out[`BYTE_BOT] : EXMEM_ALUout__out[`BYTE_TOP];
 	assign	TLB_asid2__in = (exmem_is_tlbw) ? EXMEM_stdata__out[13:8] : asid;
 
 	assign	MEM__addr2 =		exception_in_WB
 					?
-				{11'b0, MEMWB_exc__out}	: {EXMEM_ALUout__out[`BYTE_TOP], EXMEM_ALUout__out[`BYTE_BOT]};
+				{11'b0, MEMWB_exc__out}	: {TLB_pfn2__out, EXMEM_ALUout__out[`BYTE_BOT]};
 
 	assign	MEM__data2in =		EXMEM_stdata__out;
 	assign	WEdmem =		exmem_is_sw & ~exception_in_WB;
@@ -667,7 +672,10 @@ module RiSC (clk, reset);
 
 	assign	MEMWB_rT__in =		EXMEM_rT__out;
 	assign	MEMWB_pc__in =		EXMEM_pc__out;
-	assign	MEMWB_exc__in =		(exmem_is_tlbw) ? 7'd0 : EXMEM_exc__out;
+	assign	MEMWB_exc__in =		(exmem_is_tlbw) ? 7'd0 :
+                                (kmode & TLB_miss2__out & (exmem_is_lw | exmem_is_sw)) ? `EXC_TLBKMISS :
+                                (~kmode & TLB_miss2__out & (exmem_is_lw | exmem_is_sw)) ? `EXC_TLBUMISS :
+                                EXMEM_exc__out;
 	assign	MEMWB_rfdata__in =	MUXout_out;
 	assign	MEMWB_ifx__in =		(exmem_is_tlb_umiss | exmem_is_tlb_kmiss);	// i'll give this to you ...
 
@@ -706,8 +714,8 @@ module RiSC (clk, reset);
 
 	assign	PSR__we =	exception_in_WB;
 	assign	PSR__in =	(MEMWB_exc__out == `RFE_JUMP)
-				?	{1'b0, PSR__out[`BYTE_TOP], 1'b0, asid}
-				:	{PSR__out[14:8], kmode, 1'b1, 1'b0, asid};
+				?	{1'b0, PSR__out[`BYTE_TOP], 1'b0, 6'b0}
+				:	{PSR__out[14:8], kmode, 1'b1, 1'b0, 6'b0};
 
 
 
@@ -743,6 +751,8 @@ module RiSC (clk, reset);
 			TLB.tlbA_v, TLB.tlbA_asid, TLB.tlbA_vpn, TLB.tlbA_pfn);
 		$display("TLB-B   v=%d asid=%d vpn=%h pfn=%h",
 			TLB.tlbB_v, TLB.tlbB_asid, TLB.tlbB_vpn, TLB.tlbB_pfn);
+        $display("PSR in=%h we=%h",
+            PSR__in, PSR__we);
 
 		if (MEMWB_exc__out == `MODE_HALT) $finish;
 	end

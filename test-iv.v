@@ -18,7 +18,7 @@ module top ();
 	$readmemh("init.sys", cpu.MEM.m);
 	$readmemh("init.usr", cpu.MEM.m, 16'h0300);
 	cpu.RF.cr[4] = 16'h0009;
-	#1000	$finish;
+	#5000	$finish;
     end
 
     always begin
